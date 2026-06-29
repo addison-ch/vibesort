@@ -1,230 +1,162 @@
+// Package vibesort is a sorting library that sorts by vibes.
+//
+// Instead of writing a comparison function, you describe how you want things
+// sorted in plain English and an OpenAI model figures out the order for you.
 package vibesort
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
+	"os"
 	"time"
 )
 
 const (
-	defaultModel   = "gpt-4.1-mini"
-	defaultBaseURL = "https://api.openai.com/v1/chat/completions"
+	defaultModel    = "gpt-4o-mini"
+	defaultEndpoint = "https://api.openai.com/v1/chat/completions"
 )
 
-// Client calls OpenAI to determine a "vibe-based" ordering.
+// Client holds the configuration used to talk to the LLM.
 type Client struct {
-	apiKey     string
-	model      string
-	baseURL    string
-	httpClient *http.Client
+	APIKey     string
+	Model      string
+	Endpoint   string
+	HTTPClient *http.Client
 }
 
-// Option customizes the vibesort Client.
+// Option configures a Client.
 type Option func(*Client)
 
-// WithModel sets the LLM model used for sorting.
-func WithModel(model string) Option {
-	return func(c *Client) {
-		if strings.TrimSpace(model) != "" {
-			c.model = model
-		}
-	}
-}
+// WithAPIKey sets the OpenAI API key. If unset, OPENAI_API_KEY is used.
+func WithAPIKey(key string) Option { return func(c *Client) { c.APIKey = key } }
 
-// WithBaseURL overrides the OpenAI-compatible endpoint.
-func WithBaseURL(url string) Option {
-	return func(c *Client) {
-		if strings.TrimSpace(url) != "" {
-			c.baseURL = url
-		}
-	}
-}
+// WithModel overrides the default model (gpt-4o-mini).
+func WithModel(model string) Option { return func(c *Client) { c.Model = model } }
 
-// WithHTTPClient supplies a custom HTTP client.
-func WithHTTPClient(h *http.Client) Option {
-	return func(c *Client) {
-		if h != nil {
-			c.httpClient = h
-		}
-	}
-}
-
-// NewClient creates a vibesort client using the given OpenAI API key.
-func NewClient(apiKey string, opts ...Option) (*Client, error) {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, errors.New("api key is required")
-	}
-
+// New creates a Client. By default it reads the API key from OPENAI_API_KEY
+// and uses the gpt-4o-mini model.
+func New(opts ...Option) *Client {
 	c := &Client{
-		apiKey:  apiKey,
-		model:   defaultModel,
-		baseURL: defaultBaseURL,
-		httpClient: &http.Client{
-			Timeout: 45 * time.Second,
-		},
+		APIKey:     os.Getenv("OPENAI_API_KEY"),
+		Model:      defaultModel,
+		Endpoint:   defaultEndpoint,
+		HTTPClient: &http.Client{Timeout: 60 * time.Second},
 	}
-
 	for _, opt := range opts {
 		opt(c)
 	}
-
-	return c, nil
+	return c
 }
 
-// SortStrings returns a reordered copy of items according to the provided vibe.
+// Sort returns a new slice containing the items of the original list reordered
+// according to the natural-language descriptor (the "key"), e.g. "alphabetical",
+// "by release date, oldest first", or "most spicy to least spicy".
 //
-// Example vibes:
-//   - "most likely to survive a zombie apocalypse"
-//   - "rank by chaotic neutral energy"
-func (c *Client) SortStrings(ctx context.Context, items []string, vibe string) ([]string, error) {
-	if len(items) == 0 {
-		return nil, nil
+// The original slice is not modified.
+func Sort[T any](items []T, descriptor string, opts ...Option) ([]T, error) {
+	return SortContext(context.Background(), New(opts...), items, descriptor)
+}
+
+// SortContext is like Sort but uses a caller-supplied Client and context.
+func SortContext[T any](ctx context.Context, c *Client, items []T, descriptor string) ([]T, error) {
+	if len(items) <= 1 {
+		out := make([]T, len(items))
+		copy(out, items)
+		return out, nil
 	}
-	if strings.TrimSpace(vibe) == "" {
-		return nil, errors.New("vibe prompt is required")
+	if c.APIKey == "" {
+		return nil, fmt.Errorf("vibesort: no API key (set OPENAI_API_KEY or use WithAPIKey)")
 	}
 
-	userPrompt := buildPrompt(items, vibe)
-	reqBody := chatCompletionRequest{
-		Model: c.model,
-		Messages: []chatMessage{
-			{
-				Role: "system",
-				Content: "You are a vibe ranking engine. Return ONLY JSON with this shape: " +
-					`{"order":[integer,...]}` +
-					". The array must include every input index exactly once.",
-			},
-			{
-				Role:    "user",
-				Content: userPrompt,
-			},
-		},
-		Temperature: 0.9,
-	}
-
-	payload, err := json.Marshal(reqBody)
+	order, err := c.askForOrder(ctx, items, descriptor)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, err
+	}
+	if len(order) != len(items) {
+		return nil, fmt.Errorf("vibesort: model returned %d indices, expected %d", len(order), len(items))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai error (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
-	}
-
-	var completion chatCompletionResponse
-	if err := json.Unmarshal(respBytes, &completion); err != nil {
-		return nil, fmt.Errorf("decode openai response: %w", err)
-	}
-	if len(completion.Choices) == 0 {
-		return nil, errors.New("openai response had no choices")
-	}
-
-	raw := completion.Choices[0].Message.Content
-	order, err := parseOrder(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse model order: %w", err)
-	}
-	if err := validateOrder(order, len(items)); err != nil {
-		return nil, fmt.Errorf("invalid model order: %w", err)
-	}
-
-	out := make([]string, 0, len(items))
+	out := make([]T, 0, len(items))
+	seen := make(map[int]bool, len(items))
 	for _, idx := range order {
+		if idx < 0 || idx >= len(items) || seen[idx] {
+			return nil, fmt.Errorf("vibesort: model returned invalid index %d", idx)
+		}
+		seen[idx] = true
 		out = append(out, items[idx])
 	}
 	return out, nil
 }
 
-func buildPrompt(items []string, vibe string) string {
-	var b strings.Builder
-	b.WriteString("Sort these items by vibe.\n")
-	b.WriteString("Vibe: ")
-	b.WriteString(vibe)
-	b.WriteString("\nItems (index: value):\n")
-	for i, item := range items {
-		b.WriteString(fmt.Sprintf("%d: %q\n", i, item))
-	}
-	b.WriteString("Respond with JSON only.")
-	return b.String()
-}
-
-func parseOrder(raw string) ([]int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, errors.New("empty content")
+// askForOrder asks the model for the sorted order of item indices.
+func (c *Client) askForOrder(ctx context.Context, items any, descriptor string) ([]int, error) {
+	itemsJSON, err := json.MarshalIndent(items, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("vibesort: marshal items: %w", err)
 	}
 
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start == -1 || end == -1 || end < start {
-		return nil, errors.New("no JSON object found")
-	}
+	system := "You are Vibesort, a sorting engine. You are given a JSON array of " +
+		"items (0-indexed) and a sorting instruction. Return ONLY a JSON object of " +
+		"the form {\"order\": [...]} where order lists the original item indices " +
+		"sorted according to the instruction. Include every index exactly once. " +
+		"Do not include any prose."
+	user := fmt.Sprintf("Sorting instruction: %s\n\nItems:\n%s", descriptor, itemsJSON)
 
-	var data struct {
-		Order []int `json:"order"`
+	reqBody := map[string]any{
+		"model":           c.Model,
+		"temperature":     0,
+		"response_format": map[string]string{"type": "json_object"},
+		"messages": []map[string]string{
+			{"role": "system", "content": system},
+			{"role": "user", "content": user},
+		},
 	}
-	if err := json.Unmarshal([]byte(raw[start:end+1]), &data); err != nil {
+	buf, err := json.Marshal(reqBody)
+	if err != nil {
 		return nil, err
 	}
-	return data.Order, nil
-}
 
-func validateOrder(order []int, expectedLen int) error {
-	if len(order) != expectedLen {
-		return fmt.Errorf("expected %d indexes, got %d", expectedLen, len(order))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
 	}
-	seen := make(map[int]bool, expectedLen)
-	for _, v := range order {
-		if v < 0 || v >= expectedLen {
-			return fmt.Errorf("index out of range: %d", v)
-		}
-		if seen[v] {
-			return fmt.Errorf("duplicate index: %d", v)
-		}
-		seen[v] = true
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("vibesort: request failed: %w", err)
 	}
-	return nil
-}
+	defer resp.Body.Close()
 
-type chatCompletionRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-}
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("vibesort: decode response: %w", err)
+	}
+	if parsed.Error != nil {
+		return nil, fmt.Errorf("vibesort: openai error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return nil, fmt.Errorf("vibesort: no choices in response (status %s)", resp.Status)
+	}
 
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type chatCompletionResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
+	var result struct {
+		Order []int `json:"order"`
+	}
+	if err := json.Unmarshal([]byte(parsed.Choices[0].Message.Content), &result); err != nil {
+		return nil, fmt.Errorf("vibesort: parse model output %q: %w", parsed.Choices[0].Message.Content, err)
+	}
+	return result.Order, nil
 }

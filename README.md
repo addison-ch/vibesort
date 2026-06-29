@@ -1,57 +1,85 @@
 # vibesort
 
-A very serious Go sorting library that sorts by **vibe**, not outdated comparisons mechanisms
+Vibe based sorting library
 
-It sends your list to OpenAI, asks for a vibe ranking, and returns the reordered slice.
+> ⚠️ This is a joke. Do not put it anywhere near production. It is non-deterministic,
+> costs money per sort, and can be confidently wrong. That's the bit.
 
 ## Install
 
-```bash
+```sh
 go get vibesort
 ```
 
-## Library Usage
+## Usage
 
 ```go
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
-	"os"
 
 	"vibesort"
 )
 
 func main() {
-	client, err := vibesort.NewClient(os.Getenv("OPENAI_API_KEY"))
-	if err != nil {
-		log.Fatal(err)
-	}
+	fruits := []string{"banana", "Apple", "cherry", "blueberry"}
 
-	items := []string{"golang", "rust", "python", "javascript"}
-	sorted, err := client.SortStrings(context.Background(), items, "most likely to start a startup this weekend")
+	// Reads the API key from the OPENAI_API_KEY environment variable.
+	sorted, err := vibesort.Sort(fruits, "alphabetically, ignoring case")
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-
-	fmt.Println(sorted)
+	fmt.Println(sorted) // [Apple banana blueberry cherry]
 }
 ```
 
-## CLI Usage
+The descriptor is just a key — anything the model can reason about works:
 
-```bash
-go run ./cmd/vibesort -vibe "would win in a dance battle" compiler linker debugger profiler
+```go
+movies := []string{"The Matrix", "Barbie", "Jaws", "Oppenheimer"}
+vibesort.Sort(movies, "by release year, oldest first")
+
+peppers := []string{"jalapeño", "ghost pepper", "bell pepper", "habanero"}
+vibesort.Sort(peppers, "mildest to spiciest")
 ```
 
-Optional model override:
+It works on any type, since items are serialized to JSON before being sent:
 
-```bash
-go run ./cmd/vibesort -model gpt-4.1 -vibe "chaotic neutral energy" alpha beta gamma
+```go
+type Person struct {
+	Name string
+	Age  int
+}
+people := []Person{{"Alice", 30}, {"Bob", 25}}
+vibesort.Sort(people, "youngest first")
 ```
 
-## Notes
+## Configuration
 
-- Default endpoint is OpenAI Chat Completions (`/v1/chat/completions`), but you can override with `WithBaseURL`.
+The API key can come from the environment or be passed explicitly, and the
+model can be overridden:
+
+```go
+sorted, err := vibesort.Sort(items, "by vibe",
+	vibesort.WithAPIKey("sk-..."),
+	vibesort.WithModel("gpt-4o"),
+)
+```
+
+For full control over the client, context, and timeouts:
+
+```go
+client := vibesort.New(vibesort.WithModel("gpt-4o"))
+sorted, err := vibesort.SortContext(ctx, client, items, "by vibe")
+```
+
+## How it works
+
+1. Your items are serialized to a 0-indexed JSON array.
+2. The array and your descriptor are sent to the model, which is asked to
+   return the indices in sorted order.
+3. We validate the returned permutation and reorder the original items — so the
+   items you get back are exactly the ones you put in, just rearranged.
+
+The original slice is never mutated.
